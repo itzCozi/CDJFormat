@@ -11,8 +11,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// version is the current version of CDJFormat
 var version = "0.1.0"
 
+// main is the entry point for the CDJFormat CLI application
 func main() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
