@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 )
 
@@ -836,6 +837,18 @@ func runIOMeasure(testFile string) BenchmarkResult {
 	}
 	defer os.Remove(testFile)
 
+	// Create progress bar for write test
+	writeBar := progressbar.NewOptions(testSize,
+		progressbar.OptionSetDescription("Write test"),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionThrottle(100*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Println()
+		}),
+	)
+
 	writeStart := time.Now()
 	bytesWritten := 0
 	for bytesWritten < testSize {
@@ -851,6 +864,7 @@ func runIOMeasure(testFile string) BenchmarkResult {
 			return result
 		}
 		bytesWritten += n
+		writeBar.Add(n)
 	}
 
 	if syncErr := file.Sync(); syncErr != nil {
@@ -873,12 +887,25 @@ func runIOMeasure(testFile string) BenchmarkResult {
 	}
 	defer readFile.Close()
 
+	// Create progress bar for read test
+	readBar := progressbar.NewOptions(testSize,
+		progressbar.OptionSetDescription("Read test"),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionThrottle(100*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Println()
+		}),
+	)
+
 	readStart := time.Now()
 	totalRead := 0
 	for {
 		n, readErr := readFile.Read(chunk)
 		if n > 0 {
 			totalRead += n
+			readBar.Add(n)
 		}
 
 		if readErr != nil {
@@ -1144,19 +1171,23 @@ func formatMac(device, label string) error {
 	fmt.Println("Creating FAT32 filesystem...")
 
 	// Show progress indicator
+	bar := progressbar.NewOptions(-1,
+		progressbar.OptionSetDescription("Formatting "+device),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionThrottle(100*time.Millisecond),
+	)
+
 	done := make(chan bool)
 	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
+		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
-		dots := 0
 		for {
 			select {
 			case <-done:
-				fmt.Println()
 				return
 			case <-ticker.C:
-				fmt.Printf("\rFormatting %s... %s", device, strings.Repeat(".", dots%4))
-				dots++
+				bar.Add(1)
 			}
 		}
 	}()
@@ -1164,6 +1195,8 @@ func formatMac(device, label string) error {
 	formatCmd := exec.Command("diskutil", "eraseDisk", "FAT32", label, "MBR", device)
 	output, err := formatCmd.CombinedOutput()
 	done <- true
+	bar.Finish()
+	fmt.Println()
 
 	if err != nil {
 		return fmt.Errorf("diskutil failed: %v\nOutput: %s", err, output)
@@ -1186,19 +1219,23 @@ func formatWindows(device, label string) error {
 
 	fmt.Println("Creating FAT32 filesystem...")
 
+	bar := progressbar.NewOptions(-1,
+		progressbar.OptionSetDescription("Formatting "+device),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionSetWidth(40),
+		progressbar.OptionThrottle(100*time.Millisecond),
+	)
+
 	done := make(chan bool)
 	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond)
+		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
-		dots := 0
 		for {
 			select {
 			case <-done:
-				fmt.Println()
 				return
 			case <-ticker.C:
-				fmt.Printf("\rFormatting %s... %s", device, strings.Repeat(".", dots%4))
-				dots++
+				bar.Add(1)
 			}
 		}
 	}()
@@ -1209,6 +1246,8 @@ func formatWindows(device, label string) error {
 
 	err := cmd.Run()
 	done <- true
+	bar.Finish()
+	fmt.Println()
 
 	if err != nil {
 		return fmt.Errorf("format command failed: %v", err)
