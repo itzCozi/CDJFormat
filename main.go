@@ -112,7 +112,6 @@ type DriveInfo struct {
 // BenchmarkResult holds drive performance metrics
 type BenchmarkResult struct {
 	WriteMBps float64
-	ReadMBps  float64
 }
 
 // ProgressWriter wraps output and shows progress
@@ -125,10 +124,14 @@ type ProgressWriter struct {
 func (pw *ProgressWriter) Update(n int64) {
 	pw.current += n
 	elapsed := time.Since(pw.start).Seconds()
-	if elapsed > 0 && pw.current > 0 {
-		speed := float64(pw.current) / elapsed / (1024 * 1024) // MB/s
+	if elapsed > 0 && pw.current > 0 && pw.total > 0 {
+		bytesPerSecond := float64(pw.current) / elapsed
+		speed := bytesPerSecond / (1024 * 1024) // MB/s
 		percent := float64(pw.current) * 100 / float64(pw.total)
-		remaining := time.Duration((float64(pw.total-pw.current) / (float64(pw.current) / elapsed)) * float64(time.Second))
+
+		remainingBytes := float64(pw.total - pw.current)
+		remainingSeconds := remainingBytes / bytesPerSecond
+		remaining := time.Duration(remainingSeconds * float64(time.Second))
 
 		fmt.Printf("\rProgress: %.1f%% | Speed: %.2f MB/s | Remaining: %s     ",
 			percent, speed, formatDuration(remaining))
