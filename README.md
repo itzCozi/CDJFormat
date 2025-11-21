@@ -2,6 +2,9 @@
 
 CDJFormat is a command line tool designed to help DJs prepare USB drives for use on standalone systems with rekordbox.
 
+## TODO
+Make the performance benchmark accurate dude we cant be giving people false numbers
+
 ## Features
 
 - 🔍 **List available drives** - See all drives connected to your system

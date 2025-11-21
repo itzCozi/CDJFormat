@@ -1,11 +1,9 @@
-//go:build darwin || windows
-// +build darwin windows
-
 package main
 
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -98,7 +96,6 @@ func init() {
 	formatCmd.Flags().StringP("label", "l", "REKORDBOX", "Volume label for the drive")
 }
 
-// DriveInfo holds information about a drive
 type DriveInfo struct {
 	Device     string
 	Label      string
@@ -112,6 +109,44 @@ type DriveInfo struct {
 // BenchmarkResult holds drive performance metrics
 type BenchmarkResult struct {
 	WriteMBps float64
+	ReadMBps  float64
+}
+
+func benchmarkSeverity(speed float64) string {
+	switch {
+	case speed <= 0:
+		return "Unable to benchmark drive."
+	case speed < 2:
+		return "WARNING: Drive appears to be extremely slow."
+	case speed < 3:
+		return "WARNING: Drive appears to be very slow."
+	case speed < 6:
+		return "WARNING: Drive appears to be slightly slow."
+	default:
+		return "Performance is OK."
+	}
+}
+
+func benchmarkSummary(result BenchmarkResult) string {
+	if result.WriteMBps <= 0 && result.ReadMBps <= 0 {
+		return benchmarkSeverity(result.WriteMBps)
+	}
+
+	lines := []string{benchmarkSeverity(result.WriteMBps)}
+
+	if result.WriteMBps > 0 {
+		lines = append(lines, fmt.Sprintf("  Write Speed: %.2f MB/s", result.WriteMBps))
+	} else {
+		lines = append(lines, "  Write Speed: unavailable")
+	}
+
+	if result.ReadMBps > 0 {
+		lines = append(lines, fmt.Sprintf("  Read Speed: %.2f MB/s", result.ReadMBps))
+	} else {
+		lines = append(lines, "  Read Speed: unavailable")
+	}
+
+	return strings.Join(lines, "\n")
 }
 
 // ProgressWriter wraps output and shows progress
@@ -167,15 +202,15 @@ func listDrives(cmd *cobra.Command, args []string) {
 }
 
 func listMacDrives() {
-	// Parse the basic list first
 	listCmd := exec.Command("diskutil", "list")
 	basicOutput, _ := listCmd.Output()
 
 	fmt.Println(string(basicOutput))
 
-	// Get detailed info for external drives
-	fmt.Println("\nDetailed drive information:")
-	fmt.Println("--------------------------------------------------")
+	fmt.Println()
+	detailTitle := "Detailed drive information:"
+	fmt.Println(detailTitle)
+	fmt.Println(strings.Repeat("-", len(detailTitle)))
 
 	infoCmd := exec.Command("diskutil", "list", "external", "physical")
 	externalOutput, err := infoCmd.Output()
@@ -216,7 +251,7 @@ func showMacDriveDetails(diskID string) {
 
 	systemWarning := ""
 	if info.IsSystem {
-		systemWarning = " [SYSTEM - DO NOT FORMAT]"
+		systemWarning = " [SYSTEM]"
 	}
 
 	fmt.Printf("%-20s %-10s %-10s %8.1f GB%s\n",
@@ -259,7 +294,7 @@ func parseMacDiskInfo(output []byte) DriveInfo {
 }
 
 func listWindowsDrives() {
-	cmd := exec.Command("wmic", "logicaldisk", "get", "name,size,freespace,volumename,description,filesystem,drivetype")
+	cmd := exec.Command("wmic", "logicaldisk", "get", "DeviceID,DriveType,FileSystem,FreeSpace,Size,VolumeName", "/format:csv")
 	output, err := cmd.Output()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error listing drives: %v\n", err)
@@ -267,54 +302,90 @@ func listWindowsDrives() {
 	}
 
 	lines := strings.Split(string(output), "\n")
-	fmt.Printf("%-20s %-6s %-10s %10s %10s %s\n", "Description", "Drive", "FileSystem", "Size", "Free", "Label")
-	fmt.Println("------------------------------------------------------------------------------------------------------------------")
 
-	for i, line := range lines {
-		if i == 0 || strings.TrimSpace(line) == "" {
+	foundRemovable := false
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "Node,") {
 			continue
 		}
 
-		parts := regexp.MustCompile(`\s+`).Split(strings.TrimSpace(line), -1)
-		if len(parts) >= 7 {
-			description := parts[0]
-			driveType := parts[1]
-			filesystem := parts[2]
-			freespace := parts[3]
-			name := parts[4]
-			sizeStr := parts[5]
-			volumeName := ""
-			if len(parts) > 6 {
-				volumeName = strings.Join(parts[6:], " ")
-			}
-
-			// Parse sizes
-			size, _ := strconv.ParseFloat(sizeStr, 64)
-			free, _ := strconv.ParseFloat(freespace, 64)
-			sizeGB := size / (1024 * 1024 * 1024)
-			freeGB := free / (1024 * 1024 * 1024)
-
-			systemWarning := ""
-			// DriveType: 2=Removable, 3=Local/Fixed, 4=Network, 5=CD-ROM
-			if driveType == "3" {
-				systemWarning = " [SYSTEM - DO NOT FORMAT]"
-			}
-
-			if sizeGB > 0 {
-				fmt.Printf("%-20s %-6s %-10s %9.1fGB %9.1fGB %s%s\n",
-					description, name, filesystem, sizeGB, freeGB, volumeName, systemWarning)
-
-				// Warn about drives over 1TB
-				if sizeGB > 1024 {
-					fmt.Printf("  ⚠️  WARNING: Drive over 1TB - may not perform well on Pioneer hardware\n")
-				}
-			}
+		parts := strings.Split(line, ",")
+		if len(parts) < 6 {
+			continue
 		}
+
+		deviceID := strings.TrimSpace(parts[1])
+		driveType := strings.TrimSpace(parts[2])
+		filesystem := strings.TrimSpace(parts[3])
+		freeStr := strings.TrimSpace(parts[4])
+		sizeStr := strings.TrimSpace(parts[5])
+		label := ""
+		if len(parts) > 6 {
+			label = strings.TrimSpace(parts[6])
+		}
+
+		if driveType != "2" {
+			continue
+		}
+
+		sizeGB := bytesToGB(sizeStr)
+		freeGB := bytesToGB(freeStr)
+
+		if sizeGB <= 0 {
+			continue
+		}
+
+		typeLabel := driveTypeLabel(driveType)
+
+		fmt.Printf("%-12s %-6s %-10s %9.1fGB %9.1fGB   %-20s\n",
+			typeLabel, deviceID, filesystem, sizeGB, freeGB, label)
+		foundRemovable = true
+
+		if sizeGB > 1024 && driveType == "2" {
+			fmt.Println("    WARNING: Drive over 1TB - may not perform well on Pioneer hardware")
+		}
+	}
+
+	if !foundRemovable {
+		fmt.Println("No removable drives found...")
 	}
 
 	fmt.Println()
 	fmt.Println("To format a drive, use: cdjf format X:")
 	fmt.Println("For multiple drives: cdjf format F: G: H:")
+}
+
+func bytesToGB(value string) float64 {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	bytes, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0
+	}
+	return bytes / (1024 * 1024 * 1024)
+}
+
+func driveTypeLabel(code string) string {
+	switch code {
+	case "1":
+		return "NoRoot"
+	case "2":
+		return "Removable"
+	case "3":
+		return "Local"
+	case "4":
+		return "Network"
+	case "5":
+		return "CDROM"
+	case "6":
+		return "RAMDisk"
+	default:
+		return "Unknown"
+	}
 }
 
 func formatDrive(cmd *cobra.Command, args []string) {
@@ -323,11 +394,9 @@ func formatDrive(cmd *cobra.Command, args []string) {
 
 	var devices []string
 
-	// If devices provided as arguments, use them
 	if len(args) > 0 {
 		devices = args
 	} else {
-		// Otherwise, prompt for device
 		fmt.Println("Available drives:")
 		listDrives(cmd, args)
 		fmt.Println()
@@ -347,43 +416,37 @@ func formatDrive(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Validate all devices first
 	for _, device := range devices {
 		if err := validateDevice(device); err != nil {
 			fmt.Fprintf(os.Stderr, "Error with device %s: %v\n", device, err)
 			os.Exit(1)
 		}
 
-		// Check if system drive
-		if isSystemDrive(device) {
-			fmt.Fprintf(os.Stderr, "Error: %s appears to be a system drive. Formatting prevented for safety.\n", device)
+		if err := ensureRemovableDevice(device); err != nil {
+			fmt.Fprintf(os.Stderr, "Error with device %s: %v\n", device, err)
 			os.Exit(1)
 		}
 
 		// Check size and warn if over 1TB
 		size := getDriveSize(device)
 		if size > 1024 {
-			fmt.Printf("⚠️  WARNING: Drive %s is %.1f GB (over 1TB)\n", device, size)
+			fmt.Printf("  WARNING: Drive %s is %.1f GB (over 1TB)\n", device, size)
 			fmt.Println("   Large drives may not perform well on Pioneer CDJ/XDJ hardware.")
 		}
 	}
 
-	// Benchmark drives if not skipping confirmation
 	if !skipConfirm && len(devices) == 1 {
 		fmt.Printf("\nBenchmarking %s to check performance...\n", devices[0])
 		result := benchmarkDrive(devices[0])
-		if result.WriteMBps > 0 {
-			fmt.Printf("Write speed: %.2f MB/s\n", result.WriteMBps)
-			if result.WriteMBps < 5.0 {
-				fmt.Println("⚠️  WARNING: This drive appears to be very slow.")
-				fmt.Print("   Do you want to proceed anyway? (yes/no): ")
-				reader := bufio.NewReader(os.Stdin)
-				response, _ := reader.ReadString('\n')
-				response = strings.ToLower(strings.TrimSpace(response))
-				if response != "yes" && response != "y" {
-					fmt.Println("Format cancelled.")
-					return
-				}
+		fmt.Println(benchmarkSummary(result))
+		if result.WriteMBps > 0 && result.WriteMBps < 5.0 {
+			fmt.Print("   Do you want to proceed anyway? (yes/no): ")
+			reader := bufio.NewReader(os.Stdin)
+			response, _ := reader.ReadString('\n')
+			response = strings.ToLower(strings.TrimSpace(response))
+			if response != "yes" && response != "y" {
+				fmt.Println("Format cancelled.")
+				return
 			}
 		}
 	}
@@ -409,7 +472,6 @@ func formatDrive(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Format drives
 	if len(devices) == 1 {
 		// Single drive - format directly
 		formatSingleDrive(devices[0], label)
@@ -421,6 +483,10 @@ func formatDrive(cmd *cobra.Command, args []string) {
 }
 
 func formatSingleDrive(device, label string) {
+	if err := ensureRemovableDevice(device); err != nil {
+		fmt.Fprintf(os.Stderr, "Refusing to format %s: %v\n", device, err)
+		os.Exit(1)
+	}
 	label = getUniqueLabel(label, device)
 
 	fmt.Printf("\nFormatting %s to FAT32...\n", device)
@@ -442,9 +508,8 @@ func formatSingleDrive(device, label string) {
 	}
 
 	fmt.Println()
-	fmt.Println("✓ Format completed successfully!")
+	fmt.Println("Format completed successfully!")
 
-	// Ask about ejecting
 	fmt.Println()
 	fmt.Print("Do you want to eject the newly formatted drive? (Y/n): ")
 	reader := bufio.NewReader(os.Stdin)
@@ -455,7 +520,7 @@ func formatSingleDrive(device, label string) {
 		if err := ejectDevice(device); err != nil {
 			fmt.Fprintf(os.Stderr, "Error ejecting drive: %v\n", err)
 		} else {
-			fmt.Println("✓ Drive ejected successfully!")
+			fmt.Println("Drive ejected successfully!")
 		}
 	}
 
@@ -485,6 +550,11 @@ func formatMultipleDrives(devices []string, baseLabel string) {
 
 			fmt.Printf("[%s] Starting format...\n", dev)
 
+			if err := ensureRemovableDevice(dev); err != nil {
+				results <- fmt.Sprintf("[%s] FAILED: %v", dev, err)
+				return
+			}
+
 			var err error
 			switch runtime.GOOS {
 			case "darwin":
@@ -494,9 +564,9 @@ func formatMultipleDrives(devices []string, baseLabel string) {
 			}
 
 			if err != nil {
-				results <- fmt.Sprintf("[%s] ✗ FAILED: %v", dev, err)
+				results <- fmt.Sprintf("[%s] FAILED: %v", dev, err)
 			} else {
-				results <- fmt.Sprintf("[%s] ✓ SUCCESS", dev)
+				results <- fmt.Sprintf("[%s] SUCCESS", dev)
 			}
 		}(device, i)
 	}
@@ -521,7 +591,7 @@ func formatMultipleDrives(devices []string, baseLabel string) {
 			if err := ejectDevice(device); err != nil {
 				fmt.Printf("[%s] Error ejecting: %v\n", device, err)
 			} else {
-				fmt.Printf("[%s] ✓ Ejected successfully\n", device)
+				fmt.Printf("[%s] Ejected successfully\n", device)
 			}
 		}
 	}
@@ -544,8 +614,19 @@ func validateDevice(device string) error {
 	return nil
 }
 
+func ensureRemovableDevice(device string) error {
+	if isSystemDrive(device) {
+		return fmt.Errorf("%s appears to be a system/internal drive. Operation blocked for safety", device)
+	}
+
+	if !isRemovableDrive(device) {
+		return fmt.Errorf("%s is not detected as a removable USB drive. Only removable drives are supported", device)
+	}
+
+	return nil
+}
+
 func parseSizeToGB(sizeStr string) float64 {
-	// Parse sizes like "32.0 GB (32000000000 Bytes)"
 	matches := sizeRegex.FindStringSubmatch(sizeStr)
 	if len(matches) >= 3 {
 		size, _ := strconv.ParseFloat(matches[1], 64)
@@ -585,28 +666,83 @@ func isSystemDrive(device string) bool {
 		return false
 
 	case "windows":
-		// Get drive type using WMIC
 		driveLetter := strings.TrimSuffix(device, ":")
-		cmd := exec.Command("wmic", "logicaldisk", "where", fmt.Sprintf("name='%s:'", driveLetter), "get", "drivetype")
+		driveType, err := windowsDriveType(device)
+		if err == nil && driveType == "3" {
+			return true
+		}
+		if strings.EqualFold(driveLetter, "C") {
+			return true
+		}
+		return false
+	}
+	return false
+}
+
+func isRemovableDrive(device string) bool {
+	switch runtime.GOOS {
+	case "darwin":
+		cmd := exec.Command("diskutil", "info", device)
 		output, err := cmd.Output()
 		if err != nil {
 			return false
 		}
 
-		// DriveType: 2=Removable, 3=Local/Fixed, 4=Network, 5=CD-ROM
-		// We consider type 3 (Fixed) as system drives
-		if strings.Contains(string(output), "3") {
-			return true
+		lines := strings.Split(string(output), "\n")
+		internal := false
+		removable := false
+		for _, line := range lines {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "Internal:") && strings.Contains(line, "Yes") {
+				internal = true
+			}
+			if strings.HasPrefix(line, "Removable Media:") && strings.Contains(line, "Yes") {
+				removable = true
+			}
+			if strings.HasPrefix(line, "Ejectable:") && strings.Contains(line, "Yes") {
+				removable = true
+			}
+			if strings.HasPrefix(line, "External:") && strings.Contains(line, "Yes") {
+				removable = true
+			}
 		}
-
-		// Also check if it's the C: drive (main system drive)
-		if strings.EqualFold(driveLetter, "C") {
-			return true
+		if internal {
+			return false
 		}
+		return removable
 
-		return false
+	case "windows":
+		driveType, err := windowsDriveType(device)
+		if err != nil {
+			return false
+		}
+		return driveType == "2"
 	}
 	return false
+}
+
+func windowsDriveType(device string) (string, error) {
+	driveLetter := strings.TrimSuffix(device, ":")
+	if driveLetter == "" {
+		return "", fmt.Errorf("invalid drive letter")
+	}
+
+	cmd := exec.Command("wmic", "logicaldisk", "where", fmt.Sprintf("name='%s:'", driveLetter), "get", "drivetype")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.EqualFold(line, "DriveType") {
+			continue
+		}
+		return line, nil
+	}
+
+	return "", fmt.Errorf("drive type not found")
 }
 
 func getDriveSize(device string) float64 {
@@ -651,18 +787,14 @@ func getDriveSize(device string) float64 {
 }
 
 func benchmarkDrive(device string) BenchmarkResult {
-	result := BenchmarkResult{}
-
 	switch runtime.GOOS {
 	case "darwin":
-		// Find the mount point for the device
 		cmd := exec.Command("diskutil", "info", device)
 		output, err := cmd.Output()
 		if err != nil {
-			return result
+			return BenchmarkResult{}
 		}
 
-		// Parse mount point from diskutil info
 		lines := strings.Split(string(output), "\n")
 		var mountPoint string
 		for _, line := range lines {
@@ -676,41 +808,94 @@ func benchmarkDrive(device string) BenchmarkResult {
 		}
 
 		if mountPoint == "" || mountPoint == "Not applicable" {
-			// Drive not mounted, can't benchmark
+			return BenchmarkResult{}
+		}
+
+		return runIOMeasure(fmt.Sprintf("%s/benchmark_test.tmp", mountPoint))
+
+	case "windows":
+		driveLetter := strings.TrimSuffix(device, ":")
+		if driveLetter == "" {
+			return BenchmarkResult{}
+		}
+		return runIOMeasure(fmt.Sprintf("%s:\\benchmark_test.tmp", driveLetter))
+	}
+
+	return BenchmarkResult{}
+}
+
+func runIOMeasure(testFile string) BenchmarkResult {
+	const testSize = 10 * 1024 * 1024 // 10 MB sample file
+
+	result := BenchmarkResult{}
+	chunk := make([]byte, 1024*1024)
+
+	file, err := os.Create(testFile)
+	if err != nil {
+		return result
+	}
+	defer os.Remove(testFile)
+
+	writeStart := time.Now()
+	bytesWritten := 0
+	for bytesWritten < testSize {
+		toWrite := len(chunk)
+		remaining := testSize - bytesWritten
+		if remaining < toWrite {
+			toWrite = remaining
+		}
+
+		n, writeErr := file.Write(chunk[:toWrite])
+		if writeErr != nil {
+			file.Close()
+			return result
+		}
+		bytesWritten += n
+	}
+
+	if syncErr := file.Sync(); syncErr != nil {
+		file.Close()
+		return result
+	}
+
+	if closeErr := file.Close(); closeErr != nil {
+		return result
+	}
+
+	writeElapsed := time.Since(writeStart).Seconds()
+	if writeElapsed > 0 {
+		result.WriteMBps = float64(testSize) / writeElapsed / (1024 * 1024)
+	}
+
+	readFile, err := os.Open(testFile)
+	if err != nil {
+		return result
+	}
+	defer readFile.Close()
+
+	readStart := time.Now()
+	totalRead := 0
+	for {
+		n, readErr := readFile.Read(chunk)
+		if n > 0 {
+			totalRead += n
+		}
+
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
 			return result
 		}
 
-		// Create test file on the mounted volume
-		testFile := fmt.Sprintf("%s/benchmark_test.tmp", mountPoint)
-		testSize := int64(10 * 1024 * 1024)
-		data := make([]byte, testSize)
-
-		start := time.Now()
-		err = os.WriteFile(testFile, data, 0644)
-		elapsed := time.Since(start).Seconds()
-
-		if err == nil {
-			result.WriteMBps = float64(testSize) / elapsed / (1024 * 1024)
-			os.Remove(testFile) // Clean up
+		if n == 0 {
+			break
 		}
+	}
 
-	case "windows":
-		// Get mount point
-		driveLetter := strings.TrimSuffix(device, ":")
-		testFile := fmt.Sprintf("%s:\\benchmark_test.tmp", driveLetter)
-
-		// Create a 10MB test file
-		testSize := int64(10 * 1024 * 1024)
-		data := make([]byte, testSize)
-
-		start := time.Now()
-		err := os.WriteFile(testFile, data, 0644)
-		elapsed := time.Since(start).Seconds()
-
-		if err == nil {
-			result.WriteMBps = float64(testSize) / elapsed / (1024 * 1024)
-			os.Remove(testFile) // Clean up
-		}
+	readElapsed := time.Since(readStart).Seconds()
+	if readElapsed > 0 && totalRead > 0 {
+		result.ReadMBps = float64(totalRead) / readElapsed / (1024 * 1024)
 	}
 
 	return result
@@ -727,10 +912,8 @@ func ejectDevice(device string) error {
 		return nil
 
 	case "windows":
-		// Windows eject using RemoveDrive.exe or PowerShell
 		driveLetter := strings.TrimSuffix(device, ":")
 
-		// Try using PowerShell
 		psCmd := fmt.Sprintf("(New-Object -comObject Shell.Application).NameSpace(17).ParseName('%s:').InvokeVerb('Eject')", driveLetter)
 		cmd := exec.Command("powershell", "-Command", psCmd)
 		output, err := cmd.CombinedOutput()
@@ -751,6 +934,11 @@ func ejectDrive(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	if err := ensureRemovableDevice(device); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
 	fmt.Printf("Ejecting %s...\n", device)
 
 	if err := ejectDevice(device); err != nil {
@@ -758,7 +946,7 @@ func ejectDrive(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Println("✓ Drive ejected successfully!")
+	fmt.Println("Drive ejected successfully!")
 	fmt.Println("It is now safe to remove the drive.")
 }
 
@@ -770,8 +958,14 @@ func showDriveInfo(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Drive Information for %s:\n", device)
-	fmt.Println("================================================")
+	if err := ensureRemovableDevice(device); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	infoTitle := fmt.Sprintf("Drive Information for %s", device)
+	fmt.Println(infoTitle)
+	fmt.Println(strings.Repeat("=", len(infoTitle)))
 
 	switch runtime.GOOS {
 	case "darwin":
@@ -780,23 +974,13 @@ func showDriveInfo(cmd *cobra.Command, args []string) {
 		showWindowsDriveInfo(device)
 	}
 
-	// Benchmark the drive
-	fmt.Println("\nPerformance Test:")
-	fmt.Println("------------------------------------------------")
+	fmt.Println()
+	perfTitle := "Performance Test:"
+	fmt.Println(perfTitle)
+	fmt.Println(strings.Repeat("-", len(perfTitle)))
 	fmt.Println("Running benchmark...")
 	result := benchmarkDrive(device)
-	if result.WriteMBps > 0 {
-		fmt.Printf("Write Speed: %.2f MB/s\n", result.WriteMBps)
-		if result.WriteMBps < 5.0 {
-			fmt.Println("⚠️  WARNING: Drive appears to be very slow")
-		} else if result.WriteMBps < 10.0 {
-			fmt.Println("⚠️  Performance is below average")
-		} else {
-			fmt.Println("✓ Performance is acceptable")
-		}
-	} else {
-		fmt.Println("Unable to benchmark drive")
-	}
+	fmt.Println(benchmarkSummary(result))
 }
 
 func showMacDriveInfo(device string) {
@@ -848,7 +1032,6 @@ func showWindowsDriveInfo(device string) {
 			if i < len(values) {
 				value := values[i]
 
-				// Format size values
 				if header == "Size" || header == "FreeSpace" {
 					if size, err := strconv.ParseFloat(value, 64); err == nil {
 						sizeGB := size / (1024 * 1024 * 1024)
@@ -877,8 +1060,8 @@ func showWindowsDriveInfo(device string) {
 
 	// Check if system drive
 	if isSystemDrive(device) {
-		fmt.Println("\n⚠️  WARNING: This appears to be a SYSTEM DRIVE")
-		fmt.Println("   Formatting this drive is NOT RECOMMENDED")
+		fmt.Println("\n  WARNING: This appears to be a SYSTEM DRIVE")
+		fmt.Println("  Formatting this drive is NOT RECOMMENDED")
 	}
 }
 
@@ -949,6 +1132,9 @@ func getUniqueLabel(baseLabel, device string) string {
 }
 
 func formatMac(device, label string) error {
+	if err := ensureRemovableDevice(device); err != nil {
+		return err
+	}
 	fmt.Println("Unmounting device...")
 	unmountCmd := exec.Command("diskutil", "unmountDisk", device)
 	if output, err := unmountCmd.CombinedOutput(); err != nil {
@@ -988,6 +1174,9 @@ func formatMac(device, label string) error {
 }
 
 func formatWindows(device, label string) error {
+	if err := ensureRemovableDevice(device); err != nil {
+		return err
+	}
 	// Use format command with device defaults
 	// /FS:FAT32 - File system
 	// /V: - Volume label
@@ -997,7 +1186,6 @@ func formatWindows(device, label string) error {
 
 	fmt.Println("Creating FAT32 filesystem...")
 
-	// Show progress indicator since Windows format doesn't provide real-time progress
 	done := make(chan bool)
 	go func() {
 		ticker := time.NewTicker(500 * time.Millisecond)
