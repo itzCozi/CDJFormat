@@ -18,6 +18,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var (
+	diskIDRegex = regexp.MustCompile(`/dev/(disk\d+)`)
+	sizeRegex   = regexp.MustCompile(`([\d.]+)\s*(GB|MB|TB|Bytes)`)
+)
+
 var version = "0.1.0"
 
 func main() {
@@ -120,7 +125,7 @@ type ProgressWriter struct {
 func (pw *ProgressWriter) Update(n int64) {
 	pw.current += n
 	elapsed := time.Since(pw.start).Seconds()
-	if elapsed > 0 {
+	if elapsed > 0 && pw.current > 0 {
 		speed := float64(pw.current) / elapsed / (1024 * 1024) // MB/s
 		percent := float64(pw.current) * 100 / float64(pw.total)
 		remaining := time.Duration((float64(pw.total-pw.current) / (float64(pw.current) / elapsed)) * float64(time.Second))
@@ -187,8 +192,7 @@ func listMacDrives() {
 }
 
 func extractDiskID(line string) string {
-	re := regexp.MustCompile(`/dev/(disk\d+)`)
-	matches := re.FindStringSubmatch(line)
+	matches := diskIDRegex.FindStringSubmatch(line)
 	if len(matches) > 1 {
 		return matches[1]
 	}
@@ -539,8 +543,7 @@ func validateDevice(device string) error {
 
 func parseSizeToGB(sizeStr string) float64 {
 	// Parse sizes like "32.0 GB (32000000000 Bytes)"
-	re := regexp.MustCompile(`([\d.]+)\s*(GB|MB|TB|Bytes)`)
-	matches := re.FindStringSubmatch(sizeStr)
+	matches := sizeRegex.FindStringSubmatch(sizeStr)
 	if len(matches) >= 3 {
 		size, _ := strconv.ParseFloat(matches[1], 64)
 		unit := matches[2]
@@ -593,8 +596,8 @@ func isSystemDrive(device string) bool {
 			return true
 		}
 
-		// Also check if it's the C: drive or common system drives
-		if strings.EqualFold(driveLetter, "C") || strings.EqualFold(driveLetter, "D") {
+		// Also check if it's the C: drive (main system drive)
+		if strings.EqualFold(driveLetter, "C") {
 			return true
 		}
 
@@ -649,9 +652,44 @@ func benchmarkDrive(device string) BenchmarkResult {
 
 	switch runtime.GOOS {
 	case "darwin":
-		// This is a simplified benchmark - real implementation would write to mounted volume
-		// For now, return a placeholder value
-		result.WriteMBps = 15.0 // Placeholder
+		// Find the mount point for the device
+		cmd := exec.Command("diskutil", "info", device)
+		output, err := cmd.Output()
+		if err != nil {
+			return result
+		}
+
+		// Parse mount point from diskutil info
+		lines := strings.Split(string(output), "\n")
+		var mountPoint string
+		for _, line := range lines {
+			if strings.Contains(line, "Mount Point:") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					mountPoint = strings.TrimSpace(parts[1])
+					break
+				}
+			}
+		}
+
+		if mountPoint == "" || mountPoint == "Not applicable" {
+			// Drive not mounted, can't benchmark
+			return result
+		}
+
+		// Create test file on the mounted volume
+		testFile := fmt.Sprintf("%s/benchmark_test.tmp", mountPoint)
+		testSize := int64(10 * 1024 * 1024)
+		data := make([]byte, testSize)
+
+		start := time.Now()
+		err = os.WriteFile(testFile, data, 0644)
+		elapsed := time.Since(start).Seconds()
+
+		if err == nil {
+			result.WriteMBps = float64(testSize) / elapsed / (1024 * 1024)
+			os.Remove(testFile) // Clean up
+		}
 
 	case "windows":
 		// Get mount point
