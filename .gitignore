@@ -19,6 +19,7 @@ go.work
 /dist/
 CDJFormat
 cdjformat
+cdjf
 
 # IDE specific files
 .idea/

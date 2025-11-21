@@ -23,7 +23,7 @@ Thank you for your interest in contributing to CDJFormat! This document provides
 ### Building
 
 ```bash
-go build -o cdjformat
+go build -o cdjf
 ```
 
 ### Testing
@@ -32,10 +32,10 @@ Test the CLI commands:
 
 ```bash
 # List drives
-./cdjformat list
+./cdjf list
 
 # Format help
-./cdjformat format --help
+./cdjf format --help
 ```
 
 ## Code Style

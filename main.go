@@ -1,3 +1,6 @@
+//go:build darwin || windows
+// +build darwin windows
+
 package main
 
 import (
@@ -5,16 +8,16 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
 )
 
-// version is the current version of CDJFormat
 var version = "0.1.0"
 
-// main is the entry point for the CDJFormat CLI application
 func main() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -23,12 +26,12 @@ func main() {
 }
 
 var rootCmd = &cobra.Command{
-	Use:   "cdjformat",
-	Short: "CDJFormat - A tool to prepare USB drives for rekordbox",
-	Long: `CDJFormat is a command line tool designed to help DJ's prepare USB drives
+	Use:   "CDJF",
+	Short: "CDJF - Prepare USB drives for rekordbox (macOS & Windows)",
+	Long: `CDJF is a command line tool designed to help DJs prepare USB drives
 for use on standalone systems with rekordbox.
 
-It formats drives to FAT32 with optimal settings for rekordbox compatibility.`,
+It formats drives to FAT32 with optimal settings for rekordbox compatibility on macOS and Windows.`,
 	Version: version,
 }
 
@@ -39,10 +42,9 @@ var formatCmd = &cobra.Command{
 
 WARNING: This will erase all data on the selected drive!
 
-Example:
-  cdjformat format /dev/sdb    (Linux)
-  cdjformat format disk2       (macOS)
-  cdjformat format E:          (Windows)`,
+Examples:
+	cdjf format disk2       (macOS)
+	cdjf format E:          (Windows)`,
 	Args: cobra.MaximumNArgs(1),
 	Run:  formatDrive,
 }
@@ -67,8 +69,6 @@ func listDrives(cmd *cobra.Command, args []string) {
 	fmt.Println()
 
 	switch runtime.GOOS {
-	case "linux":
-		listLinuxDrives()
 	case "darwin":
 		listMacDrives()
 	case "windows":
@@ -79,36 +79,7 @@ func listDrives(cmd *cobra.Command, args []string) {
 	}
 }
 
-func listLinuxDrives() {
-	// Use lsblk to list block devices
-	cmd := exec.Command("lsblk", "-o", "NAME,SIZE,TYPE,MOUNTPOINT,VENDOR,MODEL", "-n")
-	output, err := cmd.Output()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listing drives: %v\n", err)
-		fmt.Println("Note: You may need to run this command with sudo")
-		return
-	}
-
-	fmt.Println("Device\tSize\tType\tMount\tInfo")
-	fmt.Println(strings.Repeat("-", 70))
-
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) >= 3 && (fields[2] == "disk" || fields[2] == "part") {
-			fmt.Println(line)
-		}
-	}
-
-	fmt.Println()
-	fmt.Println("To format a drive, use: cdjformat format /dev/sdX")
-}
-
 func listMacDrives() {
-	// Use diskutil to list disks
 	cmd := exec.Command("diskutil", "list")
 	output, err := cmd.Output()
 	if err != nil {
@@ -117,11 +88,10 @@ func listMacDrives() {
 	}
 
 	fmt.Println(string(output))
-	fmt.Println("To format a drive, use: cdjformat format diskX")
+	fmt.Println("To format a drive, use: cdjf format diskX")
 }
 
 func listWindowsDrives() {
-	// Use wmic to list drives
 	cmd := exec.Command("wmic", "logicaldisk", "get", "name,size,volumename,description")
 	output, err := cmd.Output()
 	if err != nil {
@@ -130,7 +100,7 @@ func listWindowsDrives() {
 	}
 
 	fmt.Println(string(output))
-	fmt.Println("To format a drive, use: cdjformat format X:")
+	fmt.Println("To format a drive, use: cdjf format X:")
 }
 
 func formatDrive(cmd *cobra.Command, args []string) {
@@ -141,7 +111,6 @@ func formatDrive(cmd *cobra.Command, args []string) {
 	if len(args) > 0 {
 		device = args[0]
 	} else {
-		// Interactive mode: show drives and ask user to select
 		fmt.Println("Available drives:")
 		listDrives(cmd, args)
 		fmt.Println()
@@ -156,16 +125,16 @@ func formatDrive(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Validate device exists
 	if err := validateDevice(device); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Show warning and get confirmation
+	label = getUniqueLabel(label, device)
+
 	if !skipConfirm {
 		fmt.Println()
-		fmt.Println("⚠️  WARNING ⚠️")
+		fmt.Println("! WARNING !")
 		fmt.Printf("This will ERASE ALL DATA on %s\n", device)
 		fmt.Println()
 		fmt.Print("Are you sure you want to continue? (yes/no): ")
@@ -180,15 +149,9 @@ func formatDrive(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Perform the format
 	fmt.Printf("\nFormatting %s to FAT32...\n", device)
 
 	switch runtime.GOOS {
-	case "linux":
-		if err := formatLinux(device, label); err != nil {
-			fmt.Fprintf(os.Stderr, "Error formatting drive: %v\n", err)
-			os.Exit(1)
-		}
 	case "darwin":
 		if err := formatMac(device, label); err != nil {
 			fmt.Fprintf(os.Stderr, "Error formatting drive: %v\n", err)
@@ -216,18 +179,11 @@ func formatDrive(cmd *cobra.Command, args []string) {
 
 func validateDevice(device string) error {
 	switch runtime.GOOS {
-	case "linux":
-		// Check if device exists
-		if _, err := os.Stat(device); os.IsNotExist(err) {
-			return fmt.Errorf("device %s does not exist", device)
-		}
 	case "darwin":
-		// Validate disk format (should be diskN)
 		if !strings.HasPrefix(device, "disk") {
 			return fmt.Errorf("invalid device format. Expected diskN (e.g., disk2)")
 		}
 	case "windows":
-		// Validate drive letter format
 		if len(device) < 2 || device[1] != ':' {
 			return fmt.Errorf("invalid drive format. Expected X: (e.g., E:)")
 		}
@@ -235,35 +191,79 @@ func validateDevice(device string) error {
 	return nil
 }
 
-func formatLinux(device, label string) error {
-	// Unmount the device first if it's mounted
-	fmt.Println("Unmounting device...")
-	exec.Command("umount", device).Run() // Ignore errors if not mounted
+func getExistingLabels(excludeDevice string) map[string]bool {
+	labels := make(map[string]bool)
 
-	// Use mkfs.vfat to format as FAT32
-	// -F 32: Force FAT32
-	// -n: Volume label
-	// -I: Don't ask questions
-	fmt.Println("Creating FAT32 filesystem...")
-	cmd := exec.Command("mkfs.vfat", "-F", "32", "-n", label, "-I", device)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("mkfs.vfat failed: %v\nOutput: %s", err, output)
+	switch runtime.GOOS {
+	case "darwin":
+		cmd := exec.Command("diskutil", "list", "-plist")
+		output, err := cmd.Output()
+		if err != nil {
+			return labels
+		}
+		lines := strings.Split(string(output), "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "VolumeName") {
+				continue
+			}
+		}
+	case "windows":
+		cmd := exec.Command("wmic", "logicaldisk", "get", "name,volumename")
+		output, err := cmd.Output()
+		if err != nil {
+			return labels
+		}
+
+		lines := strings.Split(string(output), "\n")
+		for i, line := range lines {
+			if i == 0 || strings.TrimSpace(line) == "" {
+				continue
+			}
+
+			parts := regexp.MustCompile(`\s+`).Split(strings.TrimSpace(line), 2)
+			if len(parts) >= 2 {
+				driveLetter := strings.TrimSuffix(parts[0], ":")
+				volumeName := strings.TrimSpace(parts[1])
+
+				if excludeDevice != "" && strings.HasPrefix(excludeDevice, driveLetter) {
+					continue
+				}
+
+				if volumeName != "" {
+					labels[strings.ToUpper(volumeName)] = true
+				}
+			}
+		}
 	}
 
-	return nil
+	return labels
+}
+
+func getUniqueLabel(baseLabel, device string) string {
+	existingLabels := getExistingLabels(device)
+
+	if !existingLabels[strings.ToUpper(baseLabel)] {
+		return baseLabel
+	}
+
+	for i := 2; i <= 99; i++ {
+		candidate := baseLabel + strconv.Itoa(i)
+		if !existingLabels[strings.ToUpper(candidate)] {
+			fmt.Printf("Label '%s' already exists, using '%s' instead\n", baseLabel, candidate)
+			return candidate
+		}
+	}
+
+	return baseLabel
 }
 
 func formatMac(device, label string) error {
-	// Use diskutil to format
-	// First unmount
 	fmt.Println("Unmounting device...")
 	unmountCmd := exec.Command("diskutil", "unmountDisk", device)
 	if output, err := unmountCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to unmount: %v\nOutput: %s", err, output)
 	}
 
-	// Format as FAT32 (MS-DOS FAT32)
 	fmt.Println("Creating FAT32 filesystem...")
 	formatCmd := exec.Command("diskutil", "eraseDisk", "FAT32", label, "MBR", device)
 	output, err := formatCmd.CombinedOutput()
@@ -276,10 +276,10 @@ func formatMac(device, label string) error {
 }
 
 func formatWindows(device, label string) error {
-	// Use format command
+	// Use format command with device defaults
 	// /FS:FAT32 - File system
 	// /V: - Volume label
-	// /Q - Quick format
+	// /Q - Quick format (faster, doesn't scan for bad sectors)
 	// /Y - Don't ask for confirmation
 	driveLetter := strings.TrimSuffix(device, ":")
 
