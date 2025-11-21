@@ -889,7 +889,7 @@ func runIOMeasure(testFile string) BenchmarkResult {
 
 	// Create progress bar for read test
 	readBar := progressbar.NewOptions(testSize,
-		progressbar.OptionSetDescription("Read test "),
+		progressbar.OptionSetDescription("Read test"),
 		progressbar.OptionSetWidth(40),
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionThrottle(100*time.Millisecond),
