@@ -4,6 +4,8 @@ CDJFormat is a command line tool designed to help DJs prepare USB drives for use
 
 ## TODO
 Make the performance benchmark accurate dude we cant be giving people false numbers
+split main.go into multiple files for better organization
+add a progress bar for formatting and benchmarking operations
 
 ## Features
 
