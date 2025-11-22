@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 )
 
@@ -26,12 +27,24 @@ func main() {
 		out += ".exe"
 	}
 
+	projectRoot, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Unable to determine working directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	packagePath := filepath.Join(projectRoot, "src")
+	if _, statErr := os.Stat(packagePath); statErr != nil {
+		fmt.Fprintf(os.Stderr, "Package path %s not found: %v\n", packagePath, statErr)
+		os.Exit(1)
+	}
+
 	fmt.Printf("Building cdjf for %s/%s -> %s\n", goos, goarch, out)
 	args := []string{"build"}
 	if !*verbose {
 		args = append(args, "-trimpath", "-ldflags", "-s -w")
 	}
-	args = append(args, "-o", out, ".")
+	args = append(args, "-o", out, "./src")
 
 	cmd := exec.Command("go", args...)
 	cmd.Stdout = os.Stdout
